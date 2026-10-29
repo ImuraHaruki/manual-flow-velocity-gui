@@ -8,9 +8,11 @@ from unittest.mock import patch
 
 import tkinter as tk
 from tkinter import ttk
+from PIL import Image
 
 from app import (
     FlowVelocityApp,
+    adjust_image_for_display,
     calculate_velocity,
     projected_displacement,
     run_self_test,
@@ -68,6 +70,17 @@ class CalculationTests(unittest.TestCase):
         self.assertAlmostEqual(displacement, -1)
         self.assertAlmostEqual(velocity, -100)
 
+    def test_display_adjustments_do_not_modify_source(self):
+        source = Image.new("RGB", (2, 1))
+        source.putdata([(50, 50, 50), (200, 200, 200)])
+        adjusted = adjust_image_for_display(source, brightness=1.5, contrast=1.4)
+
+        source_pixels = [source.getpixel((0, 0)), source.getpixel((1, 0))]
+        adjusted_pixels = [adjusted.getpixel((0, 0)), adjusted.getpixel((1, 0))]
+        self.assertEqual(source_pixels, [(50, 50, 50), (200, 200, 200)])
+        self.assertNotEqual(adjusted_pixels, source_pixels)
+        self.assertLess(adjusted.getpixel((0, 0))[0], adjusted.getpixel((1, 0))[0])
+
 
 class GuiBehaviorTests(unittest.TestCase):
     def setUp(self):
@@ -81,6 +94,7 @@ class GuiBehaviorTests(unittest.TestCase):
         self.root.update()
 
     def tearDown(self):
+        self.app._cancel_pending_jobs()
         self.root.destroy()
 
     def _set_particle(self):
@@ -264,6 +278,160 @@ class GuiBehaviorTests(unittest.TestCase):
         with patch.object(self.app, "skip_to_next_pair") as skip:
             self.assertIsNone(self.app._handle_right_arrow(event))
         skip.assert_not_called()
+
+    def test_seekbar_moves_directly_and_clears_transient_points(self):
+        self.app.images.extend([
+            Path("frame003.jpg"),
+            Path("frame004.jpg"),
+            Path("frame005.jpg"),
+            Path("frame006.jpg"),
+        ])
+        self._set_particle()
+
+        with patch.object(self.app, "_refresh_pair") as refresh:
+            self.app._apply_seekbar_position(4)
+
+        self.assertEqual(self.app.current_index, 4)
+        self.assertIsNone(self.app.track_before)
+        self.assertIsNone(self.app.track_after)
+        refresh.assert_called_once_with()
+
+    def test_seekbar_drag_does_not_load_until_mouse_release(self):
+        self.app.images.extend([
+            Path("frame003.jpg"),
+            Path("frame004.jpg"),
+            Path("frame005.jpg"),
+            Path("frame006.jpg"),
+        ])
+        with patch.object(self.app, "_apply_seekbar_position") as apply_position:
+            self.app._seekbar_changed("1")
+            self.app._seekbar_changed("4")
+            self.root.update()
+            apply_position.assert_not_called()
+
+            self.app.seek_var.set(4)
+            self.app._seekbar_released()
+
+        apply_position.assert_called_once_with(4)
+
+    def test_seekbar_range_and_label_follow_frame_gap(self):
+        self.app.images.extend([
+            Path("frame003.jpg"),
+            Path("frame004.jpg"),
+            Path("frame005.jpg"),
+        ])
+        self.app.frame_gap_var.set(2)
+        self.app.current_index = 2
+        self.app._sync_seekbar_from_index()
+
+        self.assertEqual(float(self.app.seek_scale.cget("to")), 2.0)
+        self.assertEqual(self.app.seek_var.get(), 2.0)
+        self.assertEqual(
+            self.app.seek_label_var.get(), "before 3/5　after 5/5"
+        )
+        self.assertEqual(self.app.frame_number_var.get(), 3)
+        self.assertEqual(float(self.app.frame_number_spinbox.cget("to")), 3.0)
+
+    def test_manual_frame_number_moves_to_requested_before_image(self):
+        self.app.images.extend([
+            Path("frame003.jpg"),
+            Path("frame004.jpg"),
+            Path("frame005.jpg"),
+        ])
+        self.app.frame_number_var.set(4)
+
+        with patch.object(self.app, "_refresh_pair") as refresh:
+            self.app.go_to_frame_number()
+
+        self.assertEqual(self.app.current_index, 3)
+        refresh.assert_called_once_with()
+
+    def test_manual_frame_number_rejects_unavailable_pair(self):
+        self.app.images.append(Path("frame003.jpg"))
+        self.app.frame_number_var.set(3)
+
+        with patch("app.messagebox.showinfo") as showinfo:
+            self.app.go_to_frame_number()
+
+        self.assertEqual(self.app.current_index, 0)
+        showinfo.assert_called_once()
+
+    def test_next_pair_preserves_zoom_and_pan(self):
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            folder = Path(temporary_folder)
+            self.app.images = []
+            for index in range(3):
+                image_path = folder / f"frame{index + 1:03d}.jpg"
+                Image.new("RGB", (100, 60), (60 + index * 20, 80, 100)).save(
+                    image_path
+                )
+                self.app.images.append(image_path)
+            self.app._refresh_pair()
+            self.root.update()
+
+            self.app.before_canvas.scale = 2.4
+            self.app.before_canvas.offset_x = -135.0
+            self.app.before_canvas.offset_y = -42.0
+            self.app.after_canvas.scale = 3.1
+            self.app.after_canvas.offset_x = -210.0
+            self.app.after_canvas.offset_y = -75.0
+            self.app.skip_to_next_pair()
+            self.root.update()
+
+        self.assertAlmostEqual(self.app.before_canvas.scale, 2.4)
+        self.assertAlmostEqual(self.app.before_canvas.offset_x, -135.0)
+        self.assertAlmostEqual(self.app.before_canvas.offset_y, -42.0)
+        self.assertAlmostEqual(self.app.after_canvas.scale, 3.1)
+        self.assertAlmostEqual(self.app.after_canvas.offset_x, -210.0)
+        self.assertAlmostEqual(self.app.after_canvas.offset_y, -75.0)
+
+    def test_autosave_restores_measurements_settings_and_position(self):
+        with tempfile.TemporaryDirectory() as temporary_folder:
+            temporary_path = Path(temporary_folder)
+            image_folder = temporary_path / "images"
+            autosave_folder = temporary_path / "autosave"
+            image_folder.mkdir()
+            image_paths = [
+                image_folder / "frame001.jpg",
+                image_folder / "frame002.jpg",
+                image_folder / "frame003.jpg",
+            ]
+            for index, image_path in enumerate(image_paths):
+                Image.new("RGB", (20, 10), (50 + index * 20, 80, 100)).save(
+                    image_path
+                )
+
+            self.app.autosave_dir = autosave_folder
+            self.app.folder = image_folder
+            self.app.images = image_paths
+            self.app.calibration_points = [(1, 2), (11, 2)]
+            self.app.mode = "measurement"
+            self.app.brightness_var.set(1.4)
+            self.app.contrast_var.set(1.7)
+            self.app.track_before = (4, 5)
+            self.app.track_after = (7, 8)
+            self.assertTrue(self.app.record_measurement())
+            self.app.current_index = 1
+            self.assertTrue(self.app._save_autosave_now())
+
+            autosave_path = self.app._autosave_path_for_folder(image_folder)
+            self.assertTrue(autosave_path.exists())
+            data = self.app._load_autosave_data(image_folder)
+            self.assertIsNotNone(data)
+
+            self.app.measurements.clear()
+            self.app.calibration_points.clear()
+            self.app.current_index = 0
+            self.app.brightness_var.set(1.0)
+            self.app.contrast_var.set(1.0)
+            self.assertTrue(self.app._restore_autosave_data(data))
+
+            self.assertEqual(len(self.app.measurements), 1)
+            self.assertEqual(self.app.calibration_points, [(1.0, 2.0), (11.0, 2.0)])
+            self.assertEqual(self.app.current_index, 1)
+            self.assertAlmostEqual(self.app.brightness_var.get(), 1.4)
+            self.assertAlmostEqual(self.app.contrast_var.get(), 1.7)
+            self.assertEqual(self.app.measurements[0].before_file, "frame001.jpg")
 
 
 if __name__ == "__main__":

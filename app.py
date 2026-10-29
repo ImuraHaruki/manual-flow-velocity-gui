@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
+import os
 import re
 import sys
 import traceback
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageTk
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.2"
 APP_TITLE = f"手動流速測定 v{APP_VERSION}"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+AUTOSAVE_SCHEMA_VERSION = 1
 
 
 def natural_key(path: Path) -> list[object]:
@@ -32,6 +36,37 @@ def list_images(folder: Path) -> list[Path]:
          if p.is_file() and p.suffix.casefold() in IMAGE_EXTENSIONS),
         key=natural_key,
     )
+
+
+def adjust_image_for_display(
+    image: Image.Image,
+    brightness: float,
+    contrast: float,
+) -> Image.Image:
+    """Return a display-only adjusted copy without modifying the source image."""
+    adjusted = image.copy()
+    if not math.isclose(brightness, 1.0):
+        adjusted = ImageEnhance.Brightness(adjusted).enhance(brightness)
+    if not math.isclose(contrast, 1.0):
+        adjusted = ImageEnhance.Contrast(adjusted).enhance(contrast)
+    return adjusted
+
+
+def default_autosave_directory() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "ManualFlowVelocity" / "autosave"
+    return Path.home() / ".manual_flow_velocity" / "autosave"
+
+
+def error_log_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = (
+        Path(local_app_data) / "ManualFlowVelocity"
+        if local_app_data
+        else Path.home() / ".manual_flow_velocity"
+    )
+    return base / "起動エラー.txt"
 
 
 def projected_displacement(
@@ -114,8 +149,11 @@ class ImageCanvas(ttk.Frame):
             highlightbackground="#667085", cursor="crosshair"
         )
         self.canvas.pack(fill="both", expand=True)
+        self.source_image: Image.Image | None = None
         self.image: Image.Image | None = None
         self.photo: ImageTk.PhotoImage | None = None
+        self.brightness = 1.0
+        self.contrast = 1.0
         self.scale = 1.0
         self.offset_x = 0.0
         self.offset_y = 0.0
@@ -130,14 +168,41 @@ class ImageCanvas(ttk.Frame):
         self.canvas.bind("<B3-Motion>", self._pan_move)
         self.canvas.bind("<Configure>", self._on_resize)
 
-    def set_image(self, path: Path, heading: str) -> None:
+    def set_image(
+        self,
+        path: Path,
+        heading: str,
+        preserve_view: bool = True,
+    ) -> None:
+        had_image = self.source_image is not None
         if self.image is not None:
             self.image.close()
+        if self.source_image is not None:
+            self.source_image.close()
         with Image.open(path) as source:
-            self.image = source.convert("RGB")
+            self.source_image = source.convert("RGB")
+        self.image = adjust_image_for_display(
+            self.source_image, self.brightness, self.contrast
+        )
         self.title_var.set(heading)
-        self._fit_pending = True
-        self.after_idle(self.fit)
+        if preserve_view and had_image:
+            self._fit_pending = False
+            self.after_idle(self.redraw)
+        else:
+            self._fit_pending = True
+            self.after_idle(self.fit)
+
+    def set_adjustments(self, brightness: float, contrast: float) -> None:
+        self.brightness = brightness
+        self.contrast = contrast
+        if self.source_image is None:
+            return
+        if self.image is not None:
+            self.image.close()
+        self.image = adjust_image_for_display(
+            self.source_image, brightness, contrast
+        )
+        self.redraw()
 
     def fit(self) -> None:
         if self.image is None:
@@ -388,7 +453,11 @@ class StartupDialog(tk.Toplevel):
 
 
 class FlowVelocityApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        autosave_dir: Path | None = None,
+    ) -> None:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1500x920")
@@ -409,17 +478,34 @@ class FlowVelocityApp:
         self.real_length_var = tk.DoubleVar(value=10.0)
         self.frame_gap_var = tk.IntVar(value=1)
         self.show_before_position_var = tk.BooleanVar(value=True)
+        self.autosave_enabled_var = tk.BooleanVar(value=True)
+        self.brightness_var = tk.DoubleVar(value=1.0)
+        self.contrast_var = tk.DoubleVar(value=1.0)
+        self.brightness_label_var = tk.StringVar(value="1.00")
+        self.contrast_label_var = tk.StringVar(value="1.00")
+        self.seek_var = tk.DoubleVar(value=0.0)
+        self.frame_number_var = tk.IntVar(value=1)
+        self.seek_label_var = tk.StringVar(value="画像未読込")
+        self.autosave_status_var = tk.StringVar(value="自動保存: 待機")
         self.status_var = tk.StringVar(value="初期設定を行ってください。")
         self.calibration_info_var = tk.StringVar(value="未校正")
         self.result_info_var = tk.StringVar(value="粒子位置を指定してください。")
         self.summary_var = tk.StringVar(value="測定数 0")
         self.selection_info_var = tk.StringVar(value="選択 0件")
         self._recalculation_job: str | None = None
+        self._display_adjustment_job: str | None = None
+        self._autosave_job: str | None = None
+        self._seekbar_job: str | None = None
+        self._updating_seekbar = False
+        self._restoring_session = False
+        self.autosave_dir = autosave_dir or default_autosave_directory()
 
         self._build_ui()
         self.real_length_var.trace_add("write", self._calculation_setting_changed)
         self.fps_var.trace_add("write", self._calculation_setting_changed)
         self.unit_var.trace_add("write", self._calculation_setting_changed)
+        self.brightness_var.trace_add("write", self._display_setting_changed)
+        self.contrast_var.trace_add("write", self._display_setting_changed)
         self.root.bind("<Control-o>", lambda _e: self.change_folder())
         self.root.bind("<Control-s>", lambda _e: self.export_csv())
         self.root.bind("<Control-a>", lambda _e: self.select_all_results())
@@ -451,6 +537,242 @@ class FlowVelocityApp:
             return None
         self.skip_to_next_pair()
         return "break"
+
+    def _display_setting_changed(self, *_args) -> None:
+        try:
+            brightness = min(max(float(self.brightness_var.get()), 0.2), 3.0)
+            contrast = min(max(float(self.contrast_var.get()), 0.2), 3.0)
+        except (ValueError, tk.TclError):
+            return
+        self.brightness_label_var.set(f"{brightness:.2f}")
+        self.contrast_label_var.set(f"{contrast:.2f}")
+        if self._restoring_session:
+            return
+        if self._display_adjustment_job is not None:
+            self.root.after_cancel(self._display_adjustment_job)
+        self._display_adjustment_job = self.root.after(
+            120, self._apply_display_adjustments
+        )
+        self._schedule_autosave()
+
+    def _apply_display_adjustments(self) -> None:
+        if self._display_adjustment_job is not None:
+            try:
+                self.root.after_cancel(self._display_adjustment_job)
+            except tk.TclError:
+                pass
+        self._display_adjustment_job = None
+        try:
+            brightness = min(max(float(self.brightness_var.get()), 0.2), 3.0)
+            contrast = min(max(float(self.contrast_var.get()), 0.2), 3.0)
+        except (ValueError, tk.TclError):
+            return
+        self.before_canvas.set_adjustments(brightness, contrast)
+        self.after_canvas.set_adjustments(brightness, contrast)
+
+    def reset_display_adjustments(self) -> None:
+        self.brightness_var.set(1.0)
+        self.contrast_var.set(1.0)
+
+    def _show_before_position_toggled(self) -> None:
+        self._redraw_both()
+        self._schedule_autosave()
+
+    def _autosave_toggled(self) -> None:
+        if self.autosave_enabled_var.get():
+            self.autosave_status_var.set("自動保存: ON")
+            self._schedule_autosave(delay_ms=0)
+        else:
+            if self._autosave_job is not None:
+                self.root.after_cancel(self._autosave_job)
+                self._autosave_job = None
+            self.autosave_status_var.set("自動保存: OFF")
+
+    def _autosave_path_for_folder(self, folder: Path) -> Path:
+        normalized = str(folder.resolve()).casefold()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+        return self.autosave_dir / f"session-{digest}.json"
+
+    def _schedule_autosave(self, delay_ms: int = 400) -> None:
+        if (
+            self._restoring_session
+            or not self.autosave_enabled_var.get()
+            or self.folder is None
+        ):
+            return
+        if self._autosave_job is not None:
+            self.root.after_cancel(self._autosave_job)
+        self._autosave_job = self.root.after(
+            delay_ms, self._save_autosave_now
+        )
+        self.autosave_status_var.set("自動保存: 変更あり")
+
+    def _autosave_payload(self) -> dict:
+        if self.folder is None:
+            raise ValueError("画像フォルダが未設定です。")
+        return {
+            "schema_version": AUTOSAVE_SCHEMA_VERSION,
+            "app_version": APP_VERSION,
+            "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "image_folder": str(self.folder.resolve()),
+            "image_count": len(self.images),
+            "first_image": self.images[0].name if self.images else "",
+            "last_image": self.images[-1].name if self.images else "",
+            "current_before_file": (
+                self.images[self.current_index].name
+                if self.images and self.current_index < len(self.images)
+                else ""
+            ),
+            "current_index": self.current_index,
+            "mode": self.mode,
+            "settings": {
+                "fps": float(self.fps_var.get()),
+                "unit": self.unit_var.get(),
+                "real_length": float(self.real_length_var.get()),
+                "frame_gap": self._frame_gap(),
+                "brightness": float(self.brightness_var.get()),
+                "contrast": float(self.contrast_var.get()),
+                "show_before_position": bool(self.show_before_position_var.get()),
+            },
+            "calibration_points": [list(point) for point in self.calibration_points],
+            "particle_clicks": {
+                str(frame_index): list(point)
+                for frame_index, point in self.particle_clicks.items()
+            },
+            "track_before": list(self.track_before) if self.track_before else None,
+            "track_after": list(self.track_after) if self.track_after else None,
+            "measurements": [asdict(measurement) for measurement in self.measurements],
+        }
+
+    def _save_autosave_now(self) -> bool:
+        if self._autosave_job is not None:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+        self._autosave_job = None
+        if (
+            not self.autosave_enabled_var.get()
+            or self.folder is None
+            or self._restoring_session
+        ):
+            return False
+        try:
+            target = self._autosave_path_for_folder(self.folder)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(self._autosave_payload(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(target)
+        except (OSError, TypeError, ValueError, tk.TclError) as error:
+            self.autosave_status_var.set("自動保存: 失敗")
+            self.status_var.set(f"自動保存に失敗しました: {error}")
+            return False
+        saved_time = datetime.now().strftime("%H:%M:%S")
+        self.autosave_status_var.set(f"自動保存: {saved_time}")
+        return True
+
+    def _load_autosave_data(self, folder: Path) -> dict | None:
+        path = self._autosave_path_for_folder(folder)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if data.get("schema_version") != AUTOSAVE_SCHEMA_VERSION:
+            return None
+        return data
+
+    def _restore_autosave_data(self, data: dict) -> bool:
+        if not self.images:
+            return False
+        image_indices = {
+            image.name.casefold(): index for index, image in enumerate(self.images)
+        }
+        settings = data.get("settings", {})
+        try:
+            self._restoring_session = True
+            self.fps_var.set(float(settings.get("fps", self.fps_var.get())))
+            unit = str(settings.get("unit", self.unit_var.get()))
+            self.unit_var.set(unit if unit in {"mm", "cm", "m"} else "cm")
+            self.real_length_var.set(
+                float(settings.get("real_length", self.real_length_var.get()))
+            )
+            frame_gap = max(1, int(settings.get("frame_gap", 1)))
+            self.frame_gap_var.set(frame_gap)
+            self.brightness_var.set(
+                min(max(float(settings.get("brightness", 1.0)), 0.2), 3.0)
+            )
+            self.contrast_var.set(
+                min(max(float(settings.get("contrast", 1.0)), 0.2), 3.0)
+            )
+            self.show_before_position_var.set(
+                bool(settings.get("show_before_position", True))
+            )
+
+            calibration = data.get("calibration_points", [])
+            self.calibration_points = [
+                (float(point[0]), float(point[1]))
+                for point in calibration[:2]
+                if isinstance(point, list) and len(point) == 2
+            ]
+            self.measurements = []
+            for item in data.get("measurements", []):
+                before_name = str(item["before_file"])
+                after_name = str(item["after_file"])
+                before_index = image_indices[before_name.casefold()]
+                after_index = image_indices[after_name.casefold()]
+                if after_index <= before_index:
+                    continue
+                measurement = Measurement(**item)
+                measurement.before_frame = before_index + 1
+                measurement.after_frame = after_index + 1
+                measurement.before_file = self.images[before_index].name
+                measurement.after_file = self.images[after_index].name
+                self.measurements.append(measurement)
+
+            self.particle_clicks = {}
+            for frame_index, point in data.get("particle_clicks", {}).items():
+                index = int(frame_index)
+                if 0 <= index < len(self.images) and len(point) == 2:
+                    self.particle_clicks[index] = (
+                        float(point[0]), float(point[1])
+                    )
+            track_before = data.get("track_before")
+            track_after = data.get("track_after")
+            self.track_before = (
+                (float(track_before[0]), float(track_before[1]))
+                if isinstance(track_before, list) and len(track_before) == 2
+                else None
+            )
+            self.track_after = (
+                (float(track_after[0]), float(track_after[1]))
+                if isinstance(track_after, list) and len(track_after) == 2
+                else None
+            )
+            before_name = str(data.get("current_before_file", ""))
+            current_index = image_indices.get(
+                before_name.casefold(), int(data.get("current_index", 0))
+            )
+            self.current_index = min(
+                max(0, current_index), max(0, len(self.images) - frame_gap - 1)
+            )
+            self.mode = (
+                "measurement"
+                if len(self.calibration_points) == 2
+                else "calibration"
+            )
+        except (KeyError, TypeError, ValueError, tk.TclError):
+            return False
+        finally:
+            self._restoring_session = False
+        self._update_calibration_info()
+        self._rebuild_table()
+        self._apply_display_adjustments()
+        return True
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -489,6 +811,15 @@ class FlowVelocityApp:
         ttk.Button(
             toolbar, text="表示を全体に合わせる", command=self.fit_images
         ).pack(side="right")
+        ttk.Checkbutton(
+            toolbar, text="自動保存",
+            variable=self.autosave_enabled_var,
+            command=self._autosave_toggled,
+        ).pack(side="right", padx=(12, 6))
+        ttk.Label(
+            toolbar, textvariable=self.autosave_status_var,
+            foreground="#475467"
+        ).pack(side="right")
 
         instruction = ttk.Frame(self.root, padding=(10, 0, 10, 8))
         instruction.pack(fill="x")
@@ -514,13 +845,92 @@ class FlowVelocityApp:
             instruction,
             text="after画像にbefore位置を表示",
             variable=self.show_before_position_var,
-            command=self._redraw_both,
+            command=self._show_before_position_toggled,
         ).pack(side="right", padx=(12, 0))
         ttk.Label(
             instruction,
             text="左クリック: 指定　ホイール: 拡大縮小　"
                  "右/中ドラッグ: 移動　←/→: 前/次",
             foreground="#667085"
+        ).pack(side="right")
+
+        display_controls = ttk.Frame(self.root, padding=(10, 0, 10, 8))
+        display_controls.pack(fill="x")
+        ttk.Label(
+            display_controls, text="画像表示", font=("", 10, "bold")
+        ).pack(side="left")
+        ttk.Label(display_controls, text="明るさ").pack(
+            side="left", padx=(14, 4)
+        )
+        ttk.Scale(
+            display_controls, from_=0.2, to=3.0,
+            variable=self.brightness_var, length=190
+        ).pack(side="left")
+        ttk.Label(
+            display_controls, textvariable=self.brightness_label_var, width=5
+        ).pack(side="left", padx=(4, 12))
+        ttk.Label(display_controls, text="コントラスト").pack(
+            side="left", padx=(0, 4)
+        )
+        ttk.Scale(
+            display_controls, from_=0.2, to=3.0,
+            variable=self.contrast_var, length=190
+        ).pack(side="left")
+        ttk.Label(
+            display_controls, textvariable=self.contrast_label_var, width=5
+        ).pack(side="left", padx=(4, 8))
+        ttk.Button(
+            display_controls, text="表示調整をリセット",
+            command=self.reset_display_adjustments
+        ).pack(side="left")
+        ttk.Label(
+            display_controls,
+            text="※表示のみ変更（元画像・計算値には影響しません）",
+            foreground="#667085"
+        ).pack(side="right")
+
+        timeline = ttk.Frame(self.root, padding=(10, 0, 10, 8))
+        timeline.pack(fill="x")
+        ttk.Label(
+            timeline, text="フレーム移動", font=("", 10, "bold")
+        ).pack(side="left")
+        ttk.Button(
+            timeline, text="先頭", command=self.go_to_first_pair, width=7
+        ).pack(side="left", padx=(10, 6))
+        self.seek_scale = ttk.Scale(
+            timeline,
+            from_=0,
+            to=1,
+            variable=self.seek_var,
+            command=self._seekbar_changed,
+            state="disabled",
+        )
+        self.seek_scale.pack(side="left", fill="x", expand=True)
+        self.seek_scale.bind("<ButtonRelease-1>", self._seekbar_released)
+        self.seek_scale.bind("<Left>", self._handle_left_arrow)
+        self.seek_scale.bind("<Right>", self._handle_right_arrow)
+        ttk.Button(
+            timeline, text="末尾", command=self.go_to_last_pair, width=7
+        ).pack(side="left", padx=(6, 12))
+        ttk.Label(timeline, text="before番号").pack(side="left")
+        self.frame_number_spinbox = ttk.Spinbox(
+            timeline,
+            textvariable=self.frame_number_var,
+            from_=1,
+            to=1,
+            width=8,
+            state="disabled",
+        )
+        self.frame_number_spinbox.pack(side="left", padx=(4, 4))
+        self.frame_number_spinbox.bind(
+            "<Return>", self._go_to_frame_from_event
+        )
+        ttk.Button(
+            timeline, text="移動", command=self.go_to_frame_number, width=6
+        ).pack(side="left", padx=(0, 10))
+        ttk.Label(
+            timeline, textvariable=self.seek_label_var, width=28,
+            anchor="e", foreground="#475467"
         ).pack(side="right")
 
         paned = ttk.Panedwindow(self.root, orient="vertical")
@@ -623,6 +1033,10 @@ class FlowVelocityApp:
             result_buttons, text="グラフ画像出力", command=self.export_graph
         ).pack(fill="x", pady=2)
         ttk.Button(
+            result_buttons, text="自動保存先を開く",
+            command=self.open_autosave_folder
+        ).pack(fill="x", pady=2)
+        ttk.Button(
             result_buttons, text="選択行の画像へ移動",
             command=self.go_to_selected_result
         ).pack(fill="x", pady=(14, 2))
@@ -675,9 +1089,14 @@ class FlowVelocityApp:
             )
             return False
         if self.measurements and not messagebox.askyesno(
-            APP_TITLE, "画像フォルダを変更すると現在の測定結果を消去します。続けますか？"
+            APP_TITLE,
+            "画像フォルダを変更しますか？\n"
+            "現在の測定結果は変更前に自動保存されます。"
         ):
             return False
+        if self.folder is not None:
+            self._save_autosave_now()
+        autosave_data = self._load_autosave_data(folder)
         self.folder = folder
         self.images = images
         self.current_index = 0
@@ -688,12 +1107,33 @@ class FlowVelocityApp:
         self.measurements.clear()
         for item in self.table.get_children():
             self.table.delete(item)
-        self.start_calibration()
+        restored = False
+        if autosave_data is not None:
+            saved_at = autosave_data.get("saved_at", "日時不明")
+            measurement_count = len(autosave_data.get("measurements", []))
+            if messagebox.askyesno(
+                APP_TITLE,
+                "この画像フォルダの自動保存データが見つかりました。\n\n"
+                f"保存日時: {saved_at}\n"
+                f"測定数: {measurement_count}\n\n"
+                "前回の作業を復元しますか？",
+            ):
+                restored = self._restore_autosave_data(autosave_data)
+        if not restored:
+            self.start_calibration()
         self._refresh_pair(fit=True)
         self._update_summary()
-        self.status_var.set(
-            f"{len(images):,}枚を読み込みました。before画像で校正点を2点指定してください。"
-        )
+        if restored:
+            self.status_var.set(
+                f"自動保存から測定{len(self.measurements)}件と作業位置を復元しました。"
+            )
+            self.autosave_status_var.set("自動保存: 復元済")
+        else:
+            self.status_var.set(
+                f"{len(images):,}枚を読み込みました。"
+                "before画像で校正点を2点指定してください。"
+            )
+            self._schedule_autosave()
         return True
 
     def _frame_gap(self) -> int:
@@ -702,9 +1142,127 @@ class FlowVelocityApp:
         except (ValueError, tk.TclError):
             return 1
 
+    def _max_before_index(self) -> int:
+        return max(0, len(self.images) - self._frame_gap() - 1)
+
+    def _seek_label(self, before_index: int) -> str:
+        if not self.images:
+            return "画像未読込"
+        gap = self._frame_gap()
+        before_index = min(max(0, before_index), self._max_before_index())
+        return (
+            f"before {before_index + 1:,}/{len(self.images):,}　"
+            f"after {before_index + gap + 1:,}/{len(self.images):,}"
+        )
+
+    def _sync_seekbar_from_index(self) -> None:
+        self._updating_seekbar = True
+        try:
+            if not self.images:
+                self.seek_scale.configure(from_=0, to=1, state="disabled")
+                self.frame_number_spinbox.configure(
+                    from_=1, to=1, state="disabled"
+                )
+                self.seek_var.set(0)
+                self.frame_number_var.set(1)
+                self.seek_label_var.set("画像未読込")
+                return
+            maximum = self._max_before_index()
+            self.current_index = min(max(0, self.current_index), maximum)
+            self.seek_scale.configure(
+                from_=0,
+                to=max(1, maximum),
+                state="normal" if maximum > 0 else "disabled",
+            )
+            self.frame_number_spinbox.configure(
+                from_=1, to=maximum + 1, state="normal"
+            )
+            self.seek_var.set(self.current_index)
+            self.frame_number_var.set(self.current_index + 1)
+            self.seek_label_var.set(self._seek_label(self.current_index))
+        finally:
+            self._updating_seekbar = False
+
+    def _cancel_pending_seek(self) -> None:
+        if self._seekbar_job is None:
+            return
+        try:
+            self.root.after_cancel(self._seekbar_job)
+        except tk.TclError:
+            pass
+        self._seekbar_job = None
+
+    def _seekbar_changed(self, value: str) -> None:
+        if self._updating_seekbar or not self.images:
+            return
+        try:
+            target = int(round(float(value)))
+        except (TypeError, ValueError):
+            return
+        target = min(max(0, target), self._max_before_index())
+        self.seek_label_var.set(self._seek_label(target))
+
+    def _seekbar_released(self, _event: tk.Event | None = None) -> str:
+        self._cancel_pending_seek()
+        self._apply_seekbar_position(int(round(self.seek_var.get())))
+        return "break"
+
+    def _apply_seekbar_position(self, index: int) -> None:
+        self._seekbar_job = None
+        if not self.images:
+            return
+        target = min(max(0, int(index)), self._max_before_index())
+        if target == self.current_index:
+            self._sync_seekbar_from_index()
+            return
+        self.current_index = target
+        self.track_before = None
+        self.track_after = None
+        self._refresh_pair()
+        self.status_var.set(
+            f"シークバーで画像ペアへ移動しました（before {target + 1:,}枚目）。"
+        )
+        self._schedule_autosave()
+
+    def go_to_first_pair(self) -> None:
+        self._cancel_pending_seek()
+        self._apply_seekbar_position(0)
+
+    def go_to_last_pair(self) -> None:
+        self._cancel_pending_seek()
+        self._apply_seekbar_position(self._max_before_index())
+
+    def _go_to_frame_from_event(self, _event: tk.Event) -> str:
+        self.go_to_frame_number()
+        return "break"
+
+    def go_to_frame_number(self) -> None:
+        if not self.images:
+            return
+        maximum = self._max_before_index() + 1
+        try:
+            frame_number = int(self.frame_number_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showinfo(
+                APP_TITLE, f"before画像番号を1～{maximum:,}で入力してください。"
+            )
+            return
+        if not 1 <= frame_number <= maximum:
+            messagebox.showinfo(
+                APP_TITLE, f"before画像番号を1～{maximum:,}で入力してください。"
+            )
+            self._sync_seekbar_from_index()
+            return
+        self._cancel_pending_seek()
+        self._apply_seekbar_position(frame_number - 1)
+        self.status_var.set(
+            f"before画像{frame_number:,}枚目の画像ペアへ移動しました。"
+        )
+
     def _gap_changed(self) -> None:
         if not self.images:
             return
+        self._cancel_pending_seek()
         gap = self._frame_gap()
         self.frame_gap_var.set(gap)
         if self.current_index + gap >= len(self.images):
@@ -712,9 +1270,11 @@ class FlowVelocityApp:
         self.track_before = None
         self.track_after = None
         self._refresh_pair()
+        self._schedule_autosave()
 
     def _refresh_pair(self, fit: bool = False) -> None:
         if not self.images:
+            self._sync_seekbar_from_index()
             return
         gap = self._frame_gap()
         after_index = self.current_index + gap
@@ -725,11 +1285,14 @@ class FlowVelocityApp:
         self.before_canvas.set_image(
             before_path,
             f"before  [{self.current_index + 1}/{len(self.images)}]  {before_path.name}",
+            preserve_view=not fit,
         )
         self.after_canvas.set_image(
             after_path,
             f"after  [{after_index + 1}/{len(self.images)}]  {after_path.name}",
+            preserve_view=not fit,
         )
+        self._sync_seekbar_from_index()
         if fit:
             self.fit_images()
         self._update_result_preview()
@@ -751,6 +1314,7 @@ class FlowVelocityApp:
             "校正モード: before画像上で、実際の長さが分かる2点を順にクリックしてください。"
         )
         self._redraw_both()
+        self._schedule_autosave()
 
     def start_measurement(self) -> None:
         if len(self.calibration_points) != 2:
@@ -772,6 +1336,7 @@ class FlowVelocityApp:
             "粒子指定モード: beforeとafterで同じ粒子を1回ずつクリックしてください。"
         )
         self._redraw_both()
+        self._schedule_autosave()
 
     def handle_image_click(
         self, side: str, point: tuple[float, float]
@@ -830,6 +1395,7 @@ class FlowVelocityApp:
                 )
         self._redraw_both()
         self._update_result_preview()
+        self._schedule_autosave()
 
     def _measurements_for_current_pair(self) -> list[Measurement]:
         if not self.images:
@@ -898,6 +1464,7 @@ class FlowVelocityApp:
             self._clear_particle_clicks_for_current_pair()
         self._update_result_preview()
         self._redraw_both()
+        self._schedule_autosave()
 
     def _clear_particle_clicks_for_current_pair(self) -> None:
         self.particle_clicks.pop(self.current_index, None)
@@ -963,6 +1530,8 @@ class FlowVelocityApp:
         )
 
     def _calculation_setting_changed(self, *_args) -> None:
+        if self._restoring_session:
+            return
         if self._recalculation_job is not None:
             self.root.after_cancel(self._recalculation_job)
         self._recalculation_job = self.root.after_idle(
@@ -970,10 +1539,16 @@ class FlowVelocityApp:
         )
 
     def _apply_calculation_setting_change(self) -> None:
+        if self._recalculation_job is not None:
+            try:
+                self.root.after_cancel(self._recalculation_job)
+            except tk.TclError:
+                pass
         self._recalculation_job = None
         self._update_calibration_info()
         self._update_result_preview()
         self._recalculate_measurements()
+        self._schedule_autosave()
 
     def _update_calibration_info(self) -> None:
         if len(self.calibration_points) != 2:
@@ -1088,6 +1663,7 @@ class FlowVelocityApp:
         self.table.see(item)
         self._update_summary()
         self.status_var.set(f"測定No.{measurement.number}を記録しました。")
+        self._schedule_autosave()
         return True
 
     def record_same_pair(self) -> None:
@@ -1103,6 +1679,7 @@ class FlowVelocityApp:
         )
 
     def record_and_next(self) -> None:
+        self._cancel_pending_seek()
         _, previous_after = self._current_particle_points()
         if not self.record_measurement():
             return
@@ -1124,8 +1701,10 @@ class FlowVelocityApp:
         self.status_var.set(
             "次の画像ペアへ進みました。前回のafter粒子位置をbeforeへ引き継ぎました。"
         )
+        self._schedule_autosave()
 
     def skip_to_next_pair(self) -> None:
+        self._cancel_pending_seek()
         if not self.images:
             return
         gap = self._frame_gap()
@@ -1147,8 +1726,10 @@ class FlowVelocityApp:
             self.status_var.set(
                 "測定結果を記録せず、次の画像ペアへスキップしました。"
             )
+        self._schedule_autosave()
 
     def previous_pair(self) -> None:
+        self._cancel_pending_seek()
         gap = self._frame_gap()
         if self.current_index <= 0:
             self.status_var.set("先頭の画像ペアです。")
@@ -1165,6 +1746,7 @@ class FlowVelocityApp:
             )
         else:
             self.status_var.set("1組前の画像ペアへ戻りました。")
+        self._schedule_autosave()
 
     def _update_summary(self) -> None:
         if not self.measurements:
@@ -1192,6 +1774,7 @@ class FlowVelocityApp:
         return "break"
 
     def go_to_selected_result(self) -> None:
+        self._cancel_pending_seek()
         selected = self.table.selection()
         if not selected:
             messagebox.showinfo(APP_TITLE, "移動する測定結果を1行選択してください。")
@@ -1217,6 +1800,7 @@ class FlowVelocityApp:
             f"測定No.{measurement.number}の画像ペアへ移動しました。"
             "記録時の粒子位置も表示しています。"
         )
+        self._schedule_autosave()
 
     def select_all_results(self) -> str:
         items = self.table.get_children()
@@ -1244,6 +1828,7 @@ class FlowVelocityApp:
             self.table.delete(item)
         self._rebuild_table()
         self._selection_changed()
+        self._schedule_autosave()
 
     def clear_all_results(self) -> None:
         if not self.measurements:
@@ -1259,6 +1844,7 @@ class FlowVelocityApp:
         self._update_summary()
         self._selection_changed()
         self.status_var.set("測定結果をすべてクリアしました。")
+        self._schedule_autosave()
 
     def _rebuild_table(self) -> None:
         for item in self.table.get_children():
@@ -1324,6 +1910,7 @@ class FlowVelocityApp:
         if skipped:
             message += f" 画像名不一致または不正な行{skipped}件は除外しました。"
         self.status_var.set(message)
+        self._schedule_autosave()
         messagebox.showinfo(APP_TITLE, message)
 
     def _read_measurements_csv(
@@ -1521,11 +2108,42 @@ class FlowVelocityApp:
         self.before_canvas.redraw()
         self.after_canvas.redraw()
 
-    def close(self) -> None:
-        if self.measurements and not messagebox.askyesno(
-            APP_TITLE, "終了しますか？ 未出力の測定結果は保存されません。"
+    def open_autosave_folder(self) -> None:
+        try:
+            self.autosave_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(self.autosave_dir)
+        except OSError as error:
+            messagebox.showerror(
+                APP_TITLE, f"自動保存先を開けませんでした。\n\n{error}"
+            )
+
+    def _cancel_pending_jobs(self) -> None:
+        for attribute in (
+            "_recalculation_job",
+            "_display_adjustment_job",
+            "_autosave_job",
+            "_seekbar_job",
         ):
-            return
+            job = getattr(self, attribute)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attribute, None)
+
+    def close(self) -> None:
+        self._save_autosave_now()
+        if self.measurements:
+            message = (
+                "終了しますか？\n\n測定結果と作業状態は自動保存されています。\n"
+                "共有・集計用のCSVは「CSV出力」から別途保存してください。"
+                if self.autosave_enabled_var.get()
+                else "終了しますか？ 未出力の測定結果は保存されません。"
+            )
+            if not messagebox.askyesno(APP_TITLE, message):
+                return
+        self._cancel_pending_jobs()
         self.root.destroy()
 
 
@@ -1575,8 +2193,9 @@ def report_gui_exception(
     details = "".join(
         traceback.format_exception(exception_type, exception, exception_traceback)
     )
-    log_path = Path(__file__).resolve().with_name("起動エラー.txt")
+    log_path = error_log_path()
     try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(details, encoding="utf-8")
     except OSError:
         pass
@@ -1598,11 +2217,14 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         details = traceback.format_exc()
-        log_path = Path(__file__).resolve().with_name("起動エラー.txt")
+        log_path = error_log_path()
         try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(details, encoding="utf-8")
         except OSError:
             pass
+        if sys.stderr is not None:
+            print(details, file=sys.stderr)
         try:
             error_root = tk.Tk()
             error_root.withdraw()

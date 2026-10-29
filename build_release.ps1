@@ -7,12 +7,16 @@ $ErrorActionPreference = 'Stop'
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $defaultPythonExe = Join-Path $env:USERPROFILE 'anaconda3\envs\flow-velocity-gui\python.exe'
 $releaseDir = Join-Path $projectDir 'release'
-$packageDir = Join-Path $releaseDir 'ManualFlowVelocity-v1.0.0-win64'
+$packageDir = Join-Path $releaseDir 'ManualFlowVelocity-v1.2.2-win64'
 $resolvedProjectDir = [IO.Path]::GetFullPath($projectDir).TrimEnd('\')
 $resolvedReleaseDir = [IO.Path]::GetFullPath($releaseDir)
+$resolvedPackageDir = [IO.Path]::GetFullPath($packageDir)
 
 if (-not $resolvedReleaseDir.StartsWith($resolvedProjectDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "Unsafe release path: $resolvedReleaseDir"
+}
+if (-not $resolvedPackageDir.StartsWith($resolvedReleaseDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Unsafe package path: $resolvedPackageDir"
 }
 
 if ([string]::IsNullOrWhiteSpace($PythonExe)) {
@@ -39,13 +43,14 @@ if (-not [string]::IsNullOrWhiteSpace($jpegDll)) {
 $pyInstallerArguments += 'app.py'
 & $PythonExe @pyInstallerArguments
 
-if (Test-Path -LiteralPath $releaseDir) {
-    Remove-Item -LiteralPath $releaseDir -Recurse -Force
+New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+if (Test-Path -LiteralPath $packageDir) {
+    Remove-Item -LiteralPath $packageDir -Recurse -Force
 }
 New-Item -ItemType Directory -Path $packageDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectDir 'dist\ManualFlowVelocity.exe') -Destination $packageDir
 Copy-Item -LiteralPath (Join-Path $projectDir 'README.md') -Destination $packageDir
 
-$zipPath = Join-Path $releaseDir 'ManualFlowVelocity-v1.0.0-win64.zip'
+$zipPath = Join-Path $releaseDir 'ManualFlowVelocity-v1.2.2-win64.zip'
 Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $zipPath -Force
 Write-Host "Release created: $zipPath"
